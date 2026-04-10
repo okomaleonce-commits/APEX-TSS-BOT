@@ -6,15 +6,22 @@ from typing import Dict
 
 # Librairies Telegram
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
 
 # Tes librairies TSS (Maths)
 import numpy as np
+import pandas as pd
 
 # Charger les variables d'environnement
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Configuration du logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 # ==============================================================================
 # 1. LOGIQUE TSS (COPIÉE DE TON SCRIPT PRÉCÉDENT)
@@ -31,6 +38,7 @@ class Demarginalizer:
     @staticmethod
     def shin(odds_list):
         n = len(odds_list)
+        if n == 0: return []
         p_brutes = np.array([1.0 / o if o > 0 else 0 for o in odds_list])
         overround = np.sum(p_brutes)
         if overround <= 1.0: return (p_brutes / overround).tolist()
@@ -56,9 +64,11 @@ class TriangulationCore:
         self.p1, self.px, self.p2 = Demarginalizer.shin([odds.odds_1, odds.odds_x, odds.odds_2])
         self.p_over, self.p_under = Demarginalizer.shin([odds.odds_over, odds.odds_under])
         self.p_btts_y, self.p_btts_n = Demarginalizer.shin([odds.odds_btts_yes, odds.odds_btts_no])
-        # Approximation pour team totals
+        
+        # Approximation pour team totals (si pas de cote directe Under)
         self.ph_over05 = Demarginalizer.shin([odds.odds_home_over05, 1/(1-1/odds.odds_home_over05)*0.95])[0]
         self.pa_over05 = Demarginalizer.shin([odds.odds_away_over05, 1/(1-1/odds.odds_away_over05)*0.95])[0]
+        
         self.p_ah_home = Demarginalizer.shin([odds.odds_ah_home, odds.odds_ah_away])[0]
         self.lambda_total = 0.0 
 
@@ -66,10 +76,14 @@ class TriangulationCore:
         """Lance l'analyse complète et retourne les résultats."""
         # 1. Module BTTS
         base_prob = self.ph_over05 * self.pa_over05
-        factor = 1.30 # Facteur moyen
+        
+        # Facteur de corrélation par tranches
+        factor = 1.30
         if base_prob < 0.20: factor = 1.08
         elif base_prob < 0.30: factor = 1.21
         elif base_prob < 0.40: factor = 1.33
+        elif base_prob < 0.50: factor = 1.29
+        elif base_prob < 0.60: factor = 1.31
         
         p_synth_btts = base_prob * factor
         
@@ -87,7 +101,7 @@ class TriangulationCore:
         p_book = self.p_btts_y
         delta = p_synth_avg - p_book
         
-        signal = "NEUTRE"
+        signal = "NEUTRE ⚪"
         if delta > 0.05: signal = "VALUE DETECTÉE 🔴"
         elif delta < -0.05: signal = "SURÉVALUÉ 🔵"
         
@@ -96,22 +110,22 @@ class TriangulationCore:
             "p_synth_btts": p_synth_avg,
             "delta": delta,
             "signal": signal,
-            "lambda": lambda_total
+            "lambda": lambda_total,
+            "cote_btts": self.raw.odds_btts_yes
         }
 
 # ==============================================================================
-# 2. FONCTION DE RÉCUPÉRATION DES COTES (A CONNECTER À UNE API RÉELLE)
+# 2. FONCTION DE RÉCUPÉRATION DES COTES (MOCK)
 # ==============================================================================
 
 def fetch_real_odds_from_api(league, home, away):
     """
-    ICI, tu devras te connecter à API-Football ou TheOddsAPI.
-    Pour l'instant, je simule une réponse pour que le bot marche.
+    Simule une API. Remplace ceci par une vraie requête API (TheOddsAPI, etc.)
+    pour avoir des données réelles pour n'importe quel match.
     """
     odds = MatchOdds()
     
-    # LOGIQUE MOCK : Si Arsenal et Liverpool, on met les vraies cotes du 04/02/2024
-    # Sinon on met des cotes génériques.
+    # LOGIQUE MOCK : Si Arsenal et Liverpool, on met les vraies cotes
     if "Arsenal" in home and "Liverpool" in away:
         odds.odds_1, odds.odds_x, odds.odds_2 = 2.52, 3.55, 2.90
         odds.odds_over, odds.odds_under = 1.78, 2.16
@@ -120,7 +134,7 @@ def fetch_real_odds_from_api(league, home, away):
         odds.ah_line = 0.0
         odds.odds_ah_home, odds.odds_ah_away = 1.99, 1.99
     else:
-        # Données génériques aléatoires pour tester
+        # Données génériques aléatoires pour les autres tests
         import random
         odds.odds_1, odds.odds_x, odds.odds_2 = 2.50, 3.40, 2.80
         odds.odds_over, odds.odds_under = 1.90, 1.90
@@ -141,7 +155,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Bienvenue sur **APEX-TSS BOT** !\n\n"
         "Je suis prêt à analyser les marchés.\n"
         "Utilise la commande : /analyse <Date> <Heure> <Ligue> <Home> <Away>\n\n"
-        "Exemple : /analyse 04/02 20:00 PL Arsenal Liverpool"
+        "Exemple : /analyse 10/04 21:00 PL Arsenal Liverpool"
     )
 
 async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,7 +192,7 @@ async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             f"📊 **ANALYSE BTTS YES**\n"
             f"--------------------------\n"
-            f"📉 Cote Marché  : {odds_data.odds_btts_yes:.2f}\n"
+            f"📉 Cote Marché  : {results['cote_btts']:.2f}\n"
             f"🧮 P(Book)      : {results['p_book_btts']:.1%}\n"
             f"🚀 P(Modèle TSS): {results['p_synth_btts']:.1%}\n"
             f"⚡ **DELTA**    : {results['delta']:+.1%}\n\n"
@@ -193,7 +207,11 @@ async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Erreur : {e}")
         await update.message.reply_text(f"⚠️ Une erreur est survenue : {e}")
 
-def main():
+# ==============================================================================
+# 4. MAIN EXECUTION (CORRIGÉ POUR PYTHON 3.14)
+# ==============================================================================
+
+async def main():
     """Point d'entrée du bot."""
     # Créer l'application
     application = Application.builder().token(TOKEN).build()
@@ -202,9 +220,9 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("analyse", analyze_match))
 
-    # Lancer le bot (polling)
+    # Lancer le bot (polling) avec await
     print("🚀 Bot démarré...")
-    application.run_polling()
+    await application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
