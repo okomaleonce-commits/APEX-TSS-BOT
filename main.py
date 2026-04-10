@@ -22,8 +22,8 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 FOOTYSTATS_KEY = os.getenv("FOOTYSTATS_KEY")
-API_KEY = os.getenv("API_KEY") # Clé générique (non utilisée directement ici, mais dispo)
-CHAT_ID = os.getenv("CHAT_ID")  # ID du chat autorisé (sécurité)
+API_KEY = os.getenv("API_KEY") # Clé générique
+CHAT_ID = os.getenv("CHAT_ID")  # ID du chat autorisé
 
 # Configuration du logging
 logging.basicConfig(
@@ -65,7 +65,7 @@ class MatchOdds:
         self.odds_home_over05, self.odds_away_over05 = 0.0, 0.0
         self.ah_line = 0.0
         self.odds_ah_home, self.odds_ah_away = 0.0, 0.0
-        self.team_stats_home = {} # Stocker les stats FootyStats
+        self.team_stats_home = {} 
         self.team_stats_away = {}
 
 class TriangulationCore:
@@ -115,7 +115,7 @@ class TriangulationCore:
         }
 
 # ==============================================================================
-# 2. INTEGRATION API ODDS (AVEC BOOKMAKERS)
+# 2. INTEGRATION API ODDS (AVEC FALLBACK ROBUSTE)
 # ==============================================================================
 
 LEAGUE_MAP = {
@@ -125,7 +125,9 @@ LEAGUE_MAP = {
 }
 
 def fetch_real_odds_from_api(league, home, away):
-    """Récupère les cotes via The-Odds-API en utilisant la variable ODDS_API_BOOKMAKERS."""
+    """
+    Récupère les cotes via The-Odds-API avec stratégie de repli (Fallback).
+    """
     odds = MatchOdds()
     
     sport_key = LEAGUE_MAP.get(league)
@@ -137,32 +139,57 @@ def fetch_real_odds_from_api(league, home, away):
         logging.error("ODDS_API_KEY manquante.")
         return None
 
-    # Utilisation de la variable ODDS_API_BOOKMAKERS
-    # Si elle est vide, on utilise Pinnacle par défaut (le plus sharp)
     target_books = os.getenv("ODDS_API_BOOKMAKERS", "pinnacle")
+    
+    # Fonction interne pour tenter une requête
+    def attempt_fetch(use_specific_books=True):
+        url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+        params = {
+            'apiKey': ODDS_API_KEY,
+            'regions': 'eu',
+            'markets': 'h2h,btts,totals',
+            'oddsFormat': 'decimal',
+            'dateFormat': 'iso',
+        }
+        
+        if use_specific_books and target_books:
+            params['bookmakers'] = target_books
 
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
-    params = {
-        'apiKey': ODDS_API_KEY,
-        'regions': 'eu',
-        'markets': 'h2h,btts,totals',
-        'oddsFormat': 'decimal',
-        'dateFormat': 'iso',
-        'bookmakers': target_books # <--- ICI on injecte la variable
-    }
+        try:
+            logging.info(f"Requête API : Books={target_books if use_specific_books else 'TOUS'}")
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                logging.critical("ERREUR 401 : Clé API invalide.")
+            elif e.response.status_code == 429:
+                logging.critical("ERREUR 429 : Quota API dépassé.")
+            else:
+                logging.error(f"Erreur HTTP API: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Erreur réseau: {e}")
+            return None
 
-    try:
-        # Timeout de 10 secondes
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        logging.error(f"Erreur API Odds: {e}")
+    # --- TENTATIVE 1 : Avec tes books spécifiques ---
+    data = attempt_fetch(use_specific_books=True)
+    
+    # --- TENTATIVE 2 : Si échec et qu'on avait un filtre, on réessaie SANS filtre ---
+    if data is None and target_books:
+        logging.warning("Aucun résultat avec le filtre bookmaker. Tentative avec TOUS les books...")
+        data = attempt_fetch(use_specific_books=False)
+
+    if not data:
         return None
 
+    # --- RECHERCHE DU MATCH ---
     match_found = None
     for event in data:
-        if home.lower() in event['home_team'].lower() and away.lower() in event['away_team'].lower():
+        h_match = event['home_team'].lower()
+        a_match = event['away_team'].lower()
+        
+        if home.lower() in h_match and away.lower() in a_match:
             match_found = event
             break
     
@@ -170,7 +197,7 @@ def fetch_real_odds_from_api(league, home, away):
         logging.warning(f"Match {home} vs {away} non trouvé.")
         return None
 
-    # Extraction des cotes
+    # --- EXTRACTION DES COTES ---
     for bookmaker in match_found['bookmakers']:
         current_odds = {}
         for market in bookmaker['markets']:
@@ -185,8 +212,9 @@ def fetch_real_odds_from_api(league, home, away):
                     if outcome['name'] == 'No': current_odds['btts_no'] = outcome['price']
             elif market['key'] == 'totals':
                 for outcome in market['outcomes']:
-                    if 'Over' in outcome['name']: current_odds['over'] = outcome['price']
-                    if 'Under' in outcome['name']: current_odds['under'] = outcome['price']
+                    name = outcome['name']
+                    if 'Over' in name and '2.5' in name: current_odds['over'] = outcome['price']
+                    if 'Under' in name and '2.5' in name: current_odds['under'] = outcome['price']
 
         if all(k in current_odds for k in ['1', 'X', '2', 'btts_yes', 'over']):
             odds.odds_1 = current_odds['1']
@@ -197,37 +225,30 @@ def fetch_real_odds_from_api(league, home, away):
             odds.odds_over = current_odds['over']
             odds.odds_under = current_odds.get('under', 0)
             
-            # Approx Team Totals
             odds.odds_home_over05 = 1.0 / (current_odds['1'] * 0.6)
             odds.odds_away_over05 = 1.0 / (current_odds['2'] * 0.6)
             odds.ah_line = 0.0
             odds.odds_ah_home = current_odds['1']
             odds.odds_ah_away = current_odds['2']
             
-            logging.info(f"Cotes récupérées (Book: {bookmaker['title']}) pour {home} vs {away}")
+            logging.info(f"✅ Cotes trouvées chez {bookmaker['title']} pour {home} vs {away}")
             return odds
 
+    logging.warning("Aucun bookmaker n'avait tous les marchés.")
     return None
 
 # ==============================================================================
-# 3. INTEGRATION FOOTYSTATS (STATISTIQUES)
+# 3. INTEGRATION FOOTYSTATS (STRUCTURE)
 # ==============================================================================
 
 def fetch_footystats_stats(team_name):
     """
-    Tente de récupérer des stats via FootyStats.
-    Note: L'API FootyStats est complexe et nécessite souvent des IDs.
-    Cette fonction est une structure prête. Si tu as l'endpoint exact pour 'team search',
-    remplace l'URL ci-dessous.
+    À compléter selon la documentation de FootyStats.
+    Retourne None pour l'instant pour éviter le crash.
     """
     if not FOOTYSTATS_KEY:
         return None
-    
-    # Exemple d'endpoint générique (à vérifier dans ta doc FootyStats)
-    # Souvent: https://api.footystats.org/league-table?key=...
-    # Ici on simule une récupération réussie ou échouée selon ta config réelle.
-    
-    # Pour l'instant, on retourne None pour ne pas bloquer le bot si l'endpoint n'est pas parfait
+    # logique d'appel API ici
     return None 
 
 # ==============================================================================
@@ -235,9 +256,8 @@ def fetch_footystats_stats(team_name):
 # ==============================================================================
 
 def check_permission(update: Update) -> bool:
-    """Vérifie si l'utilisateur a le droit d'utiliser le bot via CHAT_ID."""
     if not CHAT_ID:
-        return True # Pas de restriction si la variable est vide
+        return True 
     return str(update.effective_chat.id) == str(CHAT_ID)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,10 +266,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     await update.message.reply_text(
-        "👋 Bienvenue sur **APEX-TSS BOT v2** !\n\n"
-        "Intégration : OddsAPI + FootyStats\n"
+        "👋 Bienvenue sur **APEX-TSS BOT vFinal** !\n\n"
+        "Intégration : OddsAPI (Auto-Fallback)\n"
         "Utilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY\n\n"
-        "Exemple : /analyse 13/04 16:00 PL Arsenal Aston Villa"
+        "Exemple : /analyse 13/04 16:00 PL Arsenal Villa"
     )
 
 async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,11 +291,12 @@ async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if odds_data is None:
             await status_msg.edit_text(
                 f"❌ **Impossible de trouver les cotes.**\n"
-                f"Vérifie ligue ({league}) et noms d'équipes."
+                f"Vérifie ligue ({league}) et noms d'équipes.\n"
+                f"Ou vérifie que le match n'est pas terminé."
             )
             return
 
-        # 2. Récupération des Stats (FootyStats - optionnel)
+        # 2. Récupération des Stats
         stats_home = fetch_footystats_stats(home)
         stats_away = fetch_footystats_stats(away)
         
@@ -298,10 +319,7 @@ async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚡ **DELTA**    : {results['delta']:+.1%}\n\n"
             
             f"🎯 **SIGNAL** : {results['signal']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 **STATS (FootyStats)**\n"
-            f"Home Form: {stats_home if stats_home else 'N/A'}\n"
-            f"Away Form: {stats_away if stats_away else 'N/A'}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         await status_msg.edit_text(rapport, parse_mode='Markdown')
