@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 # ==============================================================================
-# 1. LOGIQUE TSS (COPIÉE DE TON SCRIPT PRÉCÉDENT)
+# 1. LOGIQUE TSS
 # ==============================================================================
 
 def poisson_pmf(k: int, lam: float) -> float:
@@ -64,30 +64,21 @@ class TriangulationCore:
         self.p1, self.px, self.p2 = Demarginalizer.shin([odds.odds_1, odds.odds_x, odds.odds_2])
         self.p_over, self.p_under = Demarginalizer.shin([odds.odds_over, odds.odds_under])
         self.p_btts_y, self.p_btts_n = Demarginalizer.shin([odds.odds_btts_yes, odds.odds_btts_no])
-        
-        # Approximation pour team totals (si pas de cote directe Under)
         self.ph_over05 = Demarginalizer.shin([odds.odds_home_over05, 1/(1-1/odds.odds_home_over05)*0.95])[0]
         self.pa_over05 = Demarginalizer.shin([odds.odds_away_over05, 1/(1-1/odds.odds_away_over05)*0.95])[0]
-        
         self.p_ah_home = Demarginalizer.shin([odds.odds_ah_home, odds.odds_ah_away])[0]
         self.lambda_total = 0.0 
 
     def run_analysis(self) -> Dict:
-        """Lance l'analyse complète et retourne les résultats."""
-        # 1. Module BTTS
         base_prob = self.ph_over05 * self.pa_over05
-        
-        # Facteur de corrélation par tranches
         factor = 1.30
         if base_prob < 0.20: factor = 1.08
         elif base_prob < 0.30: factor = 1.21
         elif base_prob < 0.40: factor = 1.33
         elif base_prob < 0.50: factor = 1.29
         elif base_prob < 0.60: factor = 1.31
-        
         p_synth_btts = base_prob * factor
         
-        # 2. Module Over/Under (Lambda)
         target_p_over = self.p_over
         low, high = 0.5, 5.0
         for _ in range(25):
@@ -96,18 +87,14 @@ class TriangulationCore:
             else: low = mid
         lambda_total = (low + high) / 2
         
-        # 3. Calcul Delta
-        p_synth_avg = p_synth_btts
-        p_book = self.p_btts_y
-        delta = p_synth_avg - p_book
-        
+        delta = p_synth_btts - self.p_btts_y
         signal = "NEUTRE ⚪"
         if delta > 0.05: signal = "VALUE DETECTÉE 🔴"
         elif delta < -0.05: signal = "SURÉVALUÉ 🔵"
         
         return {
-            "p_book_btts": p_book,
-            "p_synth_btts": p_synth_avg,
+            "p_book_btts": self.p_btts_y,
+            "p_synth_btts": p_synth_btts,
             "delta": delta,
             "signal": signal,
             "lambda": lambda_total,
@@ -115,17 +102,11 @@ class TriangulationCore:
         }
 
 # ==============================================================================
-# 2. FONCTION DE RÉCUPÉRATION DES COTES (MOCK)
+# 2. MOCK API
 # ==============================================================================
 
 def fetch_real_odds_from_api(league, home, away):
-    """
-    Simule une API. Remplace ceci par une vraie requête API (TheOddsAPI, etc.)
-    pour avoir des données réelles pour n'importe quel match.
-    """
     odds = MatchOdds()
-    
-    # LOGIQUE MOCK : Si Arsenal et Liverpool, on met les vraies cotes
     if "Arsenal" in home and "Liverpool" in away:
         odds.odds_1, odds.odds_x, odds.odds_2 = 2.52, 3.55, 2.90
         odds.odds_over, odds.odds_under = 1.78, 2.16
@@ -134,7 +115,6 @@ def fetch_real_odds_from_api(league, home, away):
         odds.ah_line = 0.0
         odds.odds_ah_home, odds.odds_ah_away = 1.99, 1.99
     else:
-        # Données génériques aléatoires pour les autres tests
         import random
         odds.odds_1, odds.odds_x, odds.odds_2 = 2.50, 3.40, 2.80
         odds.odds_over, odds.odds_under = 1.90, 1.90
@@ -142,7 +122,6 @@ def fetch_real_odds_from_api(league, home, away):
         odds.odds_home_over05, odds.odds_away_over05 = 1.20, 1.40
         odds.ah_line = 0.0
         odds.odds_ah_home, odds.odds_ah_away = 1.95, 1.95
-        
     return odds
 
 # ==============================================================================
@@ -150,79 +129,67 @@ def fetch_real_odds_from_api(league, home, away):
 # ==============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Message de bienvenue."""
     await update.message.reply_text(
         "👋 Bienvenue sur **APEX-TSS BOT** !\n\n"
-        "Je suis prêt à analyser les marchés.\n"
-        "Utilise la commande : /analyse <Date> <Heure> <Ligue> <Home> <Away>\n\n"
+        "Utilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY\n\n"
         "Exemple : /analyse 10/04 21:00 PL Arsenal Liverpool"
     )
 
 async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la commande /analyse."""
     try:
-        # Récupération des arguments
         args = context.args
         if len(args) < 5:
-            await update.message.reply_text("❌ Format incorrect.\nUtilise : /analyse JJ/MM HH:MM LIGNE HOME AWAY")
+            await update.message.reply_text("❌ Format incorrect.\nUtilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY")
             return
 
-        date_match = args[0]
-        heure_match = args[1]
-        league = args[2]
-        home = args[3]
-        away = args[4]
-
-        # Notification de travail
+        date_match, heure_match, league, home, away = args[0], args[1], args[2], args[3], args[4]
         status_msg = await update.message.reply_text(f"⏳ Analyse de {home} vs {away} en cours...")
 
-        # 1. Récupérer les cotes (API ou Mock)
         odds_data = fetch_real_odds_from_api(league, home, away)
-
-        # 2. Lancer le moteur TSS
         engine = TriangulationCore(odds_data)
         results = engine.run_analysis()
 
-        # 3. Formater le rapport
         rapport = (
             f"🔺 **RAPPORT TSS - {league}**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏟️ **Match** : {home} vs {away}\n"
             f"📅 **Date**  : {date_match} à {heure_match}\n\n"
-            
             f"📊 **ANALYSE BTTS YES**\n"
             f"--------------------------\n"
             f"📉 Cote Marché  : {results['cote_btts']:.2f}\n"
             f"🧮 P(Book)      : {results['p_book_btts']:.1%}\n"
             f"🚀 P(Modèle TSS): {results['p_synth_btts']:.1%}\n"
             f"⚡ **DELTA**    : {results['delta']:+.1%}\n\n"
-            
             f"🎯 **SIGNAL** : {results['signal']}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
         )
 
         await status_msg.edit_text(rapport, parse_mode='Markdown')
-
     except Exception as e:
         logging.error(f"Erreur : {e}")
         await update.message.reply_text(f"⚠️ Une erreur est survenue : {e}")
 
 # ==============================================================================
-# 4. MAIN EXECUTION (CORRIGÉ POUR PYTHON 3.14)
+# 4. MAIN EXECUTION (FIX BOUCLE ASYNCIO)
 # ==============================================================================
 
 async def main():
     """Point d'entrée du bot."""
-    # Créer l'application
     application = Application.builder().token(TOKEN).build()
 
-    # Ajouter les handlers (gestionnaires de commandes)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("analyse", analyze_match))
 
-    # Lancer le bot (polling) avec await
-    print("🚀 Bot démarré...")
-    await application.run_polling()
+    # Cette méthode 'async with' est la plus stable pour éviter les crashs de boucle
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        # Attendre indéfiniment pour garder le bot en vie
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
