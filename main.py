@@ -1,6 +1,7 @@
 import logging
 import os
 import asyncio
+import math  # <--- AJOUT IMPORTANT POUR NUMPY 2.0
 from datetime import datetime
 from typing import Dict
 
@@ -29,7 +30,8 @@ logging.basicConfig(
 
 def poisson_pmf(k: int, lam: float) -> float:
     if k < 0 or lam < 0: return 0.0
-    return (np.exp(-lam) * (lam ** k)) / np.math.factorial(k)
+    # CORRECTION ICI : math.factorial au lieu de np.math.factorial
+    return (np.exp(-lam) * (lam ** k)) / math.factorial(k)
 
 def poisson_cdf(k: int, lam: float) -> float:
     return sum(poisson_pmf(i, lam) for i in range(k + 1))
@@ -107,7 +109,15 @@ class TriangulationCore:
 
 def fetch_real_odds_from_api(league, home, away):
     odds = MatchOdds()
-    if "Arsenal" in home and "Liverpool" in away:
+    # Ajout d'un mock pour Arsenal Bournemouth pour ton test
+    if "Arsenal" in home and "Bournemouth" in away:
+        odds.odds_1, odds.odds_x, odds.odds_2 = 1.35, 5.50, 7.00
+        odds.odds_over, odds.odds_under = 1.50, 2.60
+        odds.odds_btts_yes, odds.odds_btts_no = 1.75, 2.05
+        odds.odds_home_over05, odds.odds_away_over05 = 1.10, 1.80
+        odds.ah_line = -1.5
+        odds.odds_ah_home, odds.odds_ah_away = 1.90, 1.90
+    elif "Arsenal" in home and "Liverpool" in away:
         odds.odds_1, odds.odds_x, odds.odds_2 = 2.52, 3.55, 2.90
         odds.odds_over, odds.odds_under = 1.78, 2.16
         odds.odds_btts_yes, odds.odds_btts_no = 1.64, 2.38
@@ -131,15 +141,16 @@ def fetch_real_odds_from_api(league, home, away):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Bienvenue sur **APEX-TSS BOT** !\n\n"
-        "Utilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY\n\n"
-        "Exemple : /analyse 10/04 21:00 PL Arsenal Liverpool"
+        "Utilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY\n"
+        "⚠️ N'écris PAS 'vs' entre les équipes.\n\n"
+        "Exemple : /analyse 11/04 11:30 PL Arsenal Bournemouth"
     )
 
 async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         args = context.args
         if len(args) < 5:
-            await update.message.reply_text("❌ Format incorrect.\nUtilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY")
+            await update.message.reply_text("❌ Format incorrect.\nUtilise : /analyse JJ/MM HH:MM LIGUE HOME AWAY (SANS 'vs')")
             return
 
         date_match, heure_match, league, home, away = args[0], args[1], args[2], args[3], args[4]
@@ -170,22 +181,18 @@ async def analyze_match(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Une erreur est survenue : {e}")
 
 # ==============================================================================
-# 4. MAIN EXECUTION (FIX BOUCLE ASYNCIO)
+# 4. MAIN EXECUTION
 # ==============================================================================
 
 async def main():
-    """Point d'entrée du bot."""
     application = Application.builder().token(TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("analyse", analyze_match))
 
-    # Cette méthode 'async with' est la plus stable pour éviter les crashs de boucle
     async with application:
         await application.initialize()
         await application.start()
         await application.updater.start_polling()
-        # Attendre indéfiniment pour garder le bot en vie
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
